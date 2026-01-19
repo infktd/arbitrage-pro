@@ -14,7 +14,7 @@ repositories {
 }
 
 def runeLiteVersion = 'latest.release'
-def pluginMainClass = 'com.example.ExamplePluginTest'
+def pluginMainClass = 'com.arbitragepro.ArbitrageProTest'
 
 dependencies {
 	compileOnly group: 'net.runelite', name:'client', version: runeLiteVersion
@@ -22,13 +22,19 @@ dependencies {
 	compileOnly 'org.projectlombok:lombok:1.18.30'
 	annotationProcessor 'org.projectlombok:lombok:1.18.30'
 
+	// HTTP client for backend API
+	implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
+	// JSON parsing
+	implementation 'com.google.code.gson:gson:2.10.1'
+
 	testImplementation 'junit:junit:4.12'
 	testImplementation group: 'net.runelite', name:'client', version: runeLiteVersion
 	testImplementation group: 'net.runelite', name:'jshell', version: runeLiteVersion
 }
 
-group = 'com.example'
-version = '1.0-SNAPSHOT'
+group = 'com.arbitragepro'
+version = '1.0.0'
 
 tasks.withType(JavaCompile).configureEach {
 	options.encoding = 'UTF-8'
