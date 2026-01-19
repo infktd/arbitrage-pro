@@ -20,6 +20,8 @@ import net.runelite.client.util.ImageUtil;
 import javax.inject.Inject;
 import javax.swing.*;
 import java.awt.image.BufferedImage;
+import java.util.HashMap;
+import java.util.Map;
 
 @Slf4j
 @PluginDescriptor(
@@ -48,6 +50,9 @@ public class ArbitrageProPlugin extends Plugin {
     private Recommendation currentRecommendation;
     private ActiveTrade activeTrade;
     private boolean isLoggedIn = false;
+
+    // Offer state tracking (per slot)
+    private final Map<Integer, OfferState> previousOfferStates = new HashMap<>();
 
     @Override
     protected void startUp() throws Exception {
@@ -167,7 +172,7 @@ public class ArbitrageProPlugin extends Plugin {
         });
     }
 
-    // ================== GE EVENT DETECTION ==================
+    // ================== GE EVENT DETECTION (FlippingCopilot Pattern) ==================
 
     @Subscribe
     public void onGrandExchangeOfferChanged(GrandExchangeOfferChanged event) {
@@ -180,52 +185,117 @@ public class ArbitrageProPlugin extends Plugin {
             return;
         }
 
+        int slot = event.getSlot();
         int itemId = offer.getItemId();
         int price = offer.getPrice();
-        int quantity = offer.getTotalQuantity();
-        int quantityFilled = offer.getQuantitySold();  // Bought or sold
+        int totalQuantity = offer.getTotalQuantity();
+        int quantityFilled = offer.getQuantitySold();
+        int spent = offer.getSpent();
         GrandExchangeOfferState state = offer.getState();
 
-        log.debug("GE Event: itemId={}, price={}, qty={}, filled={}, state={}",
-                itemId, price, quantity, quantityFilled, state);
+        // Create current offer state snapshot
+        OfferState currentState = new OfferState(
+                slot, itemId, price, totalQuantity, quantityFilled, spent, state, System.currentTimeMillis()
+        );
 
-        // Handle buy orders (creating new trades)
-        if (currentRecommendation != null && activeTrade == null) {
-            if (itemId == currentRecommendation.getItem_id() &&
-                price == currentRecommendation.getBuy_price() &&
-                quantity <= currentRecommendation.getBuy_quantity()) {
+        // Get previous state for this slot
+        OfferState previousState = previousOfferStates.get(slot);
 
-                if (state == GrandExchangeOfferState.BUYING) {
-                    // User placed a buy order matching our recommendation
-                    onBuyOrderPlaced(itemId, price, quantity);
-                } else if (state == GrandExchangeOfferState.BOUGHT) {
-                    // Buy order completed
-                    onBuyOrderCompleted(itemId, quantityFilled);
-                }
+        log.debug("GE Event [Slot {}]: itemId={}, price={}, qty={}, filled={}, spent={}, state={}",
+                slot, itemId, price, totalQuantity, quantityFilled, spent, state);
+
+        // Check if this is a new offer (different from previous)
+        if (currentState.isNewOffer(previousState)) {
+            log.debug("New offer detected in slot {}", slot);
+            // This is a brand new offer - user just placed it
+            handleNewOffer(currentState, previousState);
+        } else if (previousState != null) {
+            // Same offer, but state may have changed (partial fill, completion, etc.)
+            handleOfferProgress(currentState, previousState);
+        }
+
+        // Save current state for next comparison
+        previousOfferStates.put(slot, currentState);
+    }
+
+    /**
+     * Handle brand new offer placement (user just clicked confirm in GE)
+     */
+    private void handleNewOffer(OfferState current, OfferState previous) {
+        // Validate transition is consistent
+        if (!current.isConsistentTransition(previous)) {
+            log.warn("Inconsistent offer transition detected, ignoring");
+            return;
+        }
+
+        // Check if this is a BUY order matching our recommendation
+        if (current.isBuyOffer() && currentRecommendation != null && activeTrade == null) {
+            if (current.getItemId() == currentRecommendation.getItem_id() &&
+                current.getPrice() == currentRecommendation.getBuy_price() &&
+                current.getTotalQuantity() <= currentRecommendation.getBuy_quantity()) {
+
+                log.info("Buy order placed matching recommendation: {} @ {}gp",
+                        currentRecommendation.getItem_name(), current.getPrice());
+
+                // Create trade in backend
+                createTradeForOffer(current);
             }
         }
 
-        // Handle sell orders (updating existing trades)
-        if (activeTrade != null && activeTrade.getStatus().equals("bought")) {
-            if (itemId == activeTrade.getItem_id() &&
-                price == activeTrade.getSell_price()) {
+        // Check if this is a SELL order for our active trade
+        if (current.isSellOffer() && activeTrade != null && activeTrade.getStatus().equals("bought")) {
+            if (current.getItemId() == activeTrade.getItem_id() &&
+                current.getPrice() == activeTrade.getSell_price()) {
 
-                if (state == GrandExchangeOfferState.SELLING) {
-                    // User placed sell order
-                    log.info("Sell order placed for {}", activeTrade.getItem_name());
-                } else if (state == GrandExchangeOfferState.SOLD) {
-                    // Sell order completed
-                    onSellOrderCompleted(itemId, quantityFilled);
-                }
+                log.info("Sell order placed for active trade: {}", activeTrade.getItem_name());
+                // Backend will update on completion, nothing to do yet
             }
         }
     }
 
-    private void onBuyOrderPlaced(int itemId, int price, int quantity) {
+    /**
+     * Handle progress on existing offer (partial fills, completion)
+     */
+    private void handleOfferProgress(OfferState current, OfferState previous) {
+        int quantityDiff = current.getQuantitySold() - previous.getQuantitySold();
+        int spentDiff = current.getSpent() - previous.getSpent();
+
+        if (quantityDiff <= 0 && spentDiff <= 0) {
+            // No progress made
+            return;
+        }
+
+        log.debug("Offer progress: +{} quantity, +{} gp spent", quantityDiff, spentDiff);
+
+        // Check for buy order completion
+        if (current.getState() == GrandExchangeOfferState.BOUGHT &&
+            previous.getState() == GrandExchangeOfferState.BUYING) {
+
+            if (activeTrade != null && current.getItemId() == activeTrade.getItem_id()) {
+                log.info("Buy order completed: {} x{}", activeTrade.getItem_name(), current.getQuantitySold());
+                onBuyOrderCompleted(current.getItemId(), current.getQuantitySold());
+            }
+        }
+
+        // Check for sell order completion
+        if (current.getState() == GrandExchangeOfferState.SOLD &&
+            previous.getState() == GrandExchangeOfferState.SELLING) {
+
+            if (activeTrade != null && current.getItemId() == activeTrade.getItem_id()) {
+                log.info("Sell order completed: {} x{}", activeTrade.getItem_name(), current.getQuantitySold());
+                onSellOrderCompleted(current.getItemId(), current.getQuantitySold());
+            }
+        }
+    }
+
+    /**
+     * Create trade in backend when user places matching GE order (FlippingCopilot pattern)
+     */
+    private void createTradeForOffer(OfferState offer) {
         SwingUtilities.invokeLater(() -> {
             // Validate price before tracking trade
             if (currentRecommendation != null && config.validatePrices()) {
-                log.info("Validating price for item {} before tracking...", itemId);
+                log.info("Validating price for item {} before tracking...", offer.getItemId());
                 PriceValidator.ValidationResult validation = priceValidator.validate(currentRecommendation);
 
                 // Handle validation result
@@ -255,9 +325,13 @@ public class ArbitrageProPlugin extends Plugin {
                 }
             }
 
-            // Create trade
+            // Create trade in backend
             try {
-                TradeCreateResponse response = apiClient.createTrade(itemId, price, quantity);
+                TradeCreateResponse response = apiClient.createTrade(
+                        offer.getItemId(),
+                        offer.getPrice(),
+                        offer.getTotalQuantity()
+                );
                 log.info("Trade created: ID={}", response.getTrade_id());
 
                 // Fetch updated active trade
